@@ -8,8 +8,11 @@ import sqlite3
 import atexit
 import urllib.parse
 import json
+import platform
 
 class Style:
+    # Use colorama or similar if possible on Windows, but for now we assume ANSI support
+    # (available in Windows 10/11 terminals)
     RESET = '\033[0m'
     BOLD = '\033[1m'
     DIM = '\033[2m'
@@ -36,6 +39,9 @@ class BypassAutomation:
         self.guid = None
         atexit.register(self._cleanup)
 
+        # Cross-platform clear command
+        self.clear_cmd = 'cls' if os.name == 'nt' else 'clear'
+
     def log(self, msg, level='info'):
         if level == 'info':
             print(f"{Style.GREEN}[✓]{Style.RESET} {msg}")
@@ -54,16 +60,21 @@ class BypassAutomation:
 
     def _run_cmd(self, cmd, timeout=None):
         try:
+            # On Windows, shell=True might be needed for some commands, but avoiding it is safer.
+            # However, for 'cls' we need shell=True or call os.system.
+            # Here we are running executables like curl, ifuse, etc.
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             return res.returncode, res.stdout.strip(), res.stderr.strip()
         except subprocess.TimeoutExpired:
             return 124, "", "Timeout"
+        except FileNotFoundError:
+             return 127, "", f"Command not found: {cmd[0]}"
         except Exception as e:
             return 1, "", str(e)
 
     def verify_dependencies(self):
         self.log("Verifying System Requirements...", "step")
-        if shutil.which("ifuse"):
+        if os.name != 'nt' and shutil.which("ifuse"):
             self.afc_mode = "ifuse"
         else:
             self.afc_mode = "pymobiledevice3"
@@ -72,10 +83,20 @@ class BypassAutomation:
     def mount_afc(self):
         if self.afc_mode != "ifuse":
             return True
-        os.makedirs(self.mount_point, exist_ok=True)
-        code, out, _ = self._run_cmd(["mount"])
-        if self.mount_point in out:
+
+        # Double check OS
+        if os.name == 'nt':
+            self.log("ifuse is not supported on Windows. Switching to pymobiledevice3.", "warn")
+            self.afc_mode = "pymobiledevice3"
             return True
+
+        os.makedirs(self.mount_point, exist_ok=True)
+
+        # Check if already mounted (Linux/macOS specific)
+        code, out, _ = self._run_cmd(["mount"])
+        if code == 0 and self.mount_point in out:
+            return True
+
         for i in range(5):
             code, _, _ = self._run_cmd(["ifuse", self.mount_point])
             if code == 0:
@@ -86,11 +107,14 @@ class BypassAutomation:
 
     def unmount_afc(self):
         if self.afc_mode == "ifuse" and os.path.exists(self.mount_point):
-            self._run_cmd(["umount", self.mount_point])
-            try:
-                os.rmdir(self.mount_point)
-            except OSError:
-                pass
+            if os.name == 'nt':
+                 pass # No unmount on Windows if somehow we got here
+            else:
+                self._run_cmd(["umount", self.mount_point])
+                try:
+                    os.rmdir(self.mount_point)
+                except OSError:
+                    pass
 
     def _cleanup(self):
         """Ensure cleanup on exit"""
@@ -278,7 +302,7 @@ class BypassAutomation:
             return None, None, None
 
     def run(self):
-        os.system('clear')
+        os.system(self.clear_cmd)
         print(f"{Style.BOLD}{Style.MAGENTA}iOS Activation Tool - Professional Edition{Style.RESET}\n")
         
         self.verify_dependencies()
@@ -330,7 +354,8 @@ class BypassAutomation:
         
         for stage_name, stage_url in stages:
             self.log(f"Pre-loading: {stage_name}...", "detail")
-            code, http_code, _ = self._run_cmd(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", stage_url])
+            # Use os.devnull for cross-platform null output
+            code, http_code, _ = self._run_cmd(["curl", "-s", "-o", os.devnull, "-w", "%{http_code}", stage_url])
             if http_code != "200":
                 self.log(f"Warning: Failed to pre-load {stage_name} (HTTP {http_code})", "warn")
             else:
@@ -384,7 +409,7 @@ class BypassAutomation:
                 self.afc_mode = "pymobiledevice3"
         
         if self.afc_mode == "ifuse":
-            fpath = self.mount_point + target
+            fpath = os.path.join(self.mount_point, target.lstrip("/"))
             if os.path.exists(fpath):
                 os.remove(fpath)
             shutil.copy(local_db, fpath)
